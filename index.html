@@ -38,6 +38,22 @@
         .status.info { background: #d1ecf1; color: #0c5460; }
         .location-info { margin-top: 10px; padding: 8px; background: #f8f9fa; border-radius: 4px; font-size: 12px; color: #333; }
         .location-info div { margin: 3px 0; }
+
+        /* Saved paths list */
+        .saved-paths-section { margin-top: 10px; padding: 8px; background: #f8f9fa; border-radius: 4px; font-size: 12px; }
+        .saved-paths-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .saved-paths-header strong { font-size: 12px; color: #333; }
+        .saved-paths-header .storage-usage { font-size: 10px; color: #888; font-family: monospace; }
+        .saved-paths-list { max-height: 180px; overflow-y: auto; }
+        .saved-path-item { display: flex; align-items: center; padding: 4px 6px; margin-bottom: 3px; background: white; border-radius: 3px; font-size: 11px; }
+        .saved-path-item .color-swatch { width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; flex-shrink: 0; border: 1px solid rgba(0,0,0,0.2); }
+        .saved-path-item .path-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #333; }
+        .saved-path-item .path-name:hover { color: #2196F3; }
+        .saved-path-item .path-name.unsaved { color: #999; font-style: italic; }
+        .saved-path-item .delete-btn { background: none; border: none; color: #f44336; cursor: pointer; font-size: 16px; padding: 0 4px; width: auto; margin: 0; line-height: 1; }
+        .saved-path-item .delete-btn:hover { background: none; color: #b71c1c; }
+        .clear-all-btn { width: 100%; padding: 6px; background: #f44336; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 11px; margin-top: 5px; }
+        .clear-all-btn:hover { background: #d32f2f; }
     </style>
 </head>
 <body>
@@ -78,6 +94,15 @@
             <div id="status"></div>
             <div id="locationInfo" class="location-info" style="display: none;"></div>
             <div id="recordingInfo" class="location-info" style="display: none;"></div>
+
+            <div id="savedPathsSection" class="saved-paths-section" style="display: none;">
+                <div class="saved-paths-header">
+                    <strong>Saved Paths</strong>
+                    <span id="storageUsage" class="storage-usage">0 KB / 5 MB</span>
+                </div>
+                <div id="savedPathsList" class="saved-paths-list"></div>
+                <button id="clearAllBtn" class="clear-all-btn">Clear All Saved Paths</button>
+            </div>
         </div>
     </div>
 
@@ -103,9 +128,193 @@
         let currentBasemap = basemaps.dark;
         currentBasemap.addTo(map);
 
+        // --- Local Storage for uploaded paths ---
+        const STORAGE_KEY = 'geojson_paths_v1';
+        const MAX_STORAGE_SIZE = 5 * 1024 * 1024; // 5MB
+        const PATH_COLORS = ['#FF6B6B', '#4ECDC4', '#FFE66D', '#95E1D3', '#F38181', '#AA96DA', '#FCBAD3', '#6A8EAE'];
+
+        let loadedPathLayers = {}; // id -> { layer, meta, saved }
+
+        function getSavedPaths() {
+            try {
+                const data = localStorage.getItem(STORAGE_KEY);
+                return data ? JSON.parse(data) : [];
+            } catch (e) {
+                console.error('Error reading saved paths:', e);
+                return [];
+            }
+        }
+
+        function getStorageSize(paths) {
+            return new Blob([JSON.stringify(paths)]).size;
+        }
+
+        function persistPaths(paths) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(paths));
+                return true;
+            } catch (e) {
+                console.error('localStorage error:', e);
+                return false;
+            }
+        }
+
+        function nextColor() {
+            // Pick based on count of currently loaded layers so colours cycle sensibly
+            const count = Object.keys(loadedPathLayers).length;
+            return PATH_COLORS[count % PATH_COLORS.length];
+        }
+
+        function addSavedPath(name, geojson) {
+            const paths = getSavedPaths();
+            const newPath = {
+                id: 'p_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+                name: name,
+                geojson: geojson,
+                color: nextColor(),
+                uploadedAt: new Date().toISOString()
+            };
+            const testPaths = [...paths, newPath];
+            const size = getStorageSize(testPaths);
+            if (size > MAX_STORAGE_SIZE) {
+                return { success: false, reason: 'size', size, path: newPath };
+            }
+            paths.push(newPath);
+            const saved = persistPaths(paths);
+            return { success: saved, reason: saved ? null : 'quota', size, path: newPath };
+        }
+
+        function removeSavedPath(id) {
+            const paths = getSavedPaths().filter(p => p.id !== id);
+            persistPaths(paths);
+            if (loadedPathLayers[id]) {
+                map.removeLayer(loadedPathLayers[id].layer);
+                delete loadedPathLayers[id];
+            }
+            renderSavedPathsList();
+        }
+
+        function clearAllSavedPaths() {
+            if (!confirm('Remove all saved paths from local storage? (This will also unload them from the map.)')) return;
+            localStorage.removeItem(STORAGE_KEY);
+            // Remove only saved layers, keep unsaved (temp) ones visible
+            Object.entries(loadedPathLayers).forEach(([id, entry]) => {
+                if (entry.saved) {
+                    map.removeLayer(entry.layer);
+                    delete loadedPathLayers[id];
+                }
+            });
+            renderSavedPathsList();
+            showStatus('All saved paths cleared', 'info');
+        }
+
+        function addPathToMap(pathData, saved) {
+            const layer = L.geoJSON(pathData.geojson, {
+                style: { color: pathData.color, weight: 4, opacity: 0.8 },
+                pointToLayer: function(feature, latlng) {
+                    return L.circleMarker(latlng, { radius: 6, fillColor: pathData.color, color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8 });
+                },
+                onEachFeature: function(feature, layer) {
+                    let popupContent = `<div style="font-size: 13px;"><b>${pathData.name}</b><br>`;
+                    if (feature.properties) {
+                        for (let key in feature.properties) popupContent += `<b>${key}:</b> ${feature.properties[key]}<br>`;
+                    }
+                    popupContent += '</div>';
+                    layer.bindPopup(popupContent);
+                }
+            }).addTo(map);
+            loadedPathLayers[pathData.id] = { layer, meta: pathData, saved: !!saved };
+            return layer;
+        }
+
+        function renderSavedPathsList() {
+            const paths = getSavedPaths();
+            const unsavedEntries = Object.values(loadedPathLayers).filter(e => !e.saved);
+
+            const section = document.getElementById('savedPathsSection');
+            const list = document.getElementById('savedPathsList');
+            const usageEl = document.getElementById('storageUsage');
+
+            if (paths.length === 0 && unsavedEntries.length === 0) {
+                section.style.display = 'none';
+                return;
+            }
+            section.style.display = 'block';
+
+            const size = getStorageSize(paths);
+            const sizeStr = size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${(size/1024).toFixed(1)} KB` : `${(size/1024/1024).toFixed(2)} MB`;
+            const maxMB = (MAX_STORAGE_SIZE / (1024 * 1024)).toFixed(0);
+            usageEl.textContent = `${sizeStr} / ${maxMB} MB`;
+
+            list.innerHTML = '';
+
+            // Saved paths first
+            paths.forEach(p => {
+                const item = document.createElement('div');
+                item.className = 'saved-path-item';
+                item.innerHTML = `
+                    <div class="color-swatch" style="background:${p.color}"></div>
+                    <div class="path-name" data-id="${p.id}" title="Click to fit map to this path">${escapeHtml(p.name)}</div>
+                    <button class="delete-btn" data-id="${p.id}" title="Remove from storage">×</button>
+                `;
+                list.appendChild(item);
+            });
+
+            // Then any unsaved (too-big) paths currently on map
+            unsavedEntries.forEach(entry => {
+                const p = entry.meta;
+                const item = document.createElement('div');
+                item.className = 'saved-path-item';
+                item.innerHTML = `
+                    <div class="color-swatch" style="background:${p.color}"></div>
+                    <div class="path-name unsaved" data-id="${p.id}" title="Not saved (exceeds 5MB)">${escapeHtml(p.name)} (unsaved)</div>
+                    <button class="delete-btn" data-id="${p.id}" title="Remove from map">×</button>
+                `;
+                list.appendChild(item);
+            });
+
+            list.querySelectorAll('.path-name').forEach(el => {
+                el.addEventListener('click', () => {
+                    const id = el.getAttribute('data-id');
+                    const entry = loadedPathLayers[id];
+                    if (entry) map.fitBounds(entry.layer.getBounds(), { padding: [50, 50] });
+                });
+            });
+            list.querySelectorAll('.delete-btn').forEach(el => {
+                el.addEventListener('click', () => {
+                    const id = el.getAttribute('data-id');
+                    if (loadedPathLayers[id] && !loadedPathLayers[id].saved) {
+                        // Unsaved — just remove from map
+                        map.removeLayer(loadedPathLayers[id].layer);
+                        delete loadedPathLayers[id];
+                        renderSavedPathsList();
+                    } else {
+                        removeSavedPath(id);
+                    }
+                });
+            });
+        }
+
+        function escapeHtml(str) {
+            return String(str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+        }
+
+        function restorePathsFromStorage() {
+            const paths = getSavedPaths();
+            if (paths.length === 0) return;
+            paths.forEach(p => addPathToMap(p, true));
+            renderSavedPathsList();
+            const group = L.featureGroup(Object.values(loadedPathLayers).map(e => e.layer));
+            if (group.getLayers().length > 0) {
+                map.fitBounds(group.getBounds(), { padding: [50, 50] });
+            }
+            showStatus(`Restored ${paths.length} saved path${paths.length > 1 ? 's' : ''} from storage`, 'info');
+        }
+
+        // --- End local storage block ---
+
         let userMarker = null;
         let userCircle = null;
-        let pathLayer = null;
         let watchId = null;
         let isTracking = false;
         let currentPosition = null;
@@ -143,6 +352,9 @@
         const statusDiv = document.getElementById('status');
         const locationInfoDiv = document.getElementById('locationInfo');
         const recordingInfoDiv = document.getElementById('recordingInfo');
+        const clearAllBtn = document.getElementById('clearAllBtn');
+
+        clearAllBtn.addEventListener('click', clearAllSavedPaths);
 
         controlsHeader.addEventListener('click', function() {
             controlsPanel.classList.toggle('collapsed');
@@ -166,27 +378,41 @@
         fileInput.addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
+
+            // Quick pre-check on raw file size (strictly the serialized object will be similar order of magnitude)
+            if (file.size > MAX_STORAGE_SIZE) {
+                showStatus(`File is ${(file.size/1024/1024).toFixed(2)} MB — too large to save (>5MB). Loading on map only.`, 'info');
+            }
+
             const reader = new FileReader();
             reader.onload = function(event) {
                 try {
                     const geojson = JSON.parse(event.target.result);
-                    if (pathLayer) map.removeLayer(pathLayer);
-                    pathLayer = L.geoJSON(geojson, {
-                        style: { color: '#FF6B6B', weight: 4, opacity: 0.8 },
-                        pointToLayer: function(feature, latlng) {
-                            return L.circleMarker(latlng, { radius: 6, fillColor: '#FF6B6B', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8 });
-                        },
-                        onEachFeature: function(feature, layer) {
-                            if (feature.properties) {
-                                let popupContent = '<div style="font-size: 13px;">';
-                                for (let key in feature.properties) popupContent += `<b>${key}:</b> ${feature.properties[key]}<br>`;
-                                popupContent += '</div>';
-                                layer.bindPopup(popupContent);
-                            }
-                        }
-                    }).addTo(map);
-                    map.fitBounds(pathLayer.getBounds(), { padding: [50, 50] });
-                    showStatus('GeoJSON loaded successfully!', 'success');
+                    const baseName = file.name.replace(/\.(geo)?json$/i, '');
+
+                    const result = addSavedPath(baseName, geojson);
+
+                    if (result.success) {
+                        addPathToMap(result.path, true);
+                        renderSavedPathsList();
+                        map.fitBounds(loadedPathLayers[result.path.id].layer.getBounds(), { padding: [50, 50] });
+                        const sizeStr = result.size < 1024*1024 ? `${(result.size/1024).toFixed(1)} KB` : `${(result.size/1024/1024).toFixed(2)} MB`;
+                        showStatus(`'${baseName}' loaded and saved (${sizeStr} total in storage)`, 'success');
+                    } else if (result.reason === 'size') {
+                        // Add to map as unsaved
+                        addPathToMap(result.path, false);
+                        renderSavedPathsList();
+                        map.fitBounds(loadedPathLayers[result.path.id].layer.getBounds(), { padding: [50, 50] });
+                        showStatus(`'${baseName}' loaded but NOT saved — would exceed 5MB storage limit`, 'error');
+                    } else {
+                        // Quota or other write error — still show on map
+                        addPathToMap(result.path, false);
+                        renderSavedPathsList();
+                        showStatus('Loaded on map, but localStorage write failed (quota or disabled?)', 'error');
+                    }
+
+                    // Reset so the same file can be re-uploaded if needed
+                    fileInput.value = '';
                 } catch (error) {
                     showStatus('Error loading GeoJSON: ' + error.message, 'error');
                 }
@@ -205,21 +431,20 @@
         });
 
         fitPathButton.addEventListener('click', function() {
-            if (pathLayer) map.fitBounds(pathLayer.getBounds(), { padding: [50, 50] });
-            else showStatus('No path loaded', 'error');
+            const layers = Object.values(loadedPathLayers).map(e => e.layer);
+            if (layers.length === 0) { showStatus('No paths loaded', 'error'); return; }
+            const group = L.featureGroup(layers);
+            map.fitBounds(group.getBounds(), { padding: [50, 50] });
         });
 
-        // FIXED: Simplified permission request
         function requestLocationPermission() {
             if (!navigator.geolocation) {
                 showStatus('Geolocation not supported by your browser', 'error');
                 return;
             }
-            // Directly request tracking - let the browser handle the UI
             startTracking();
         }
 
-        // FIXED: Increased timeout and error handling
         function startTracking() {
             showStatus('Requesting GPS access (wait for prompt)...', 'info');
 
@@ -233,7 +458,7 @@
                 {
                     enableHighAccuracy: true,
                     maximumAge: 0,
-                    timeout: 30000 // Increased to 30 seconds for Android
+                    timeout: 30000
                 }
             );
 
@@ -315,7 +540,6 @@
             }
             showStatus(message, 'error');
             
-            // Reset UI on fatal error
             isTracking = false;
             toggleButton.textContent = 'Enable Location';
             toggleButton.style.background = '#4CAF50';
@@ -420,6 +644,9 @@
             statusDiv.className = 'status ' + type;
             statusDiv.style.display = 'block';
         }
+
+        // Restore any previously saved paths on page load
+        restorePathsFromStorage();
     </script>
 </body>
 </html>
